@@ -1,0 +1,63 @@
+usdt:./build/sendrecv_perf:nccl_tests_sdt:bench_test_start
+{
+    @bench_start[tid] = nsecs; // Start timestamp for the benchmark
+}
+
+usdt:./build/sendrecv_perf:nccl_tests_sdt:bench_test_stop
+/(@bench_start[tid] != 0)/ 
+{
+    $iterations = arg0;
+    @bench_latency[tid] = nsecs - @bench_start[tid];
+
+    if ($iterations > 0) {
+        @bench_latency[tid] /= $iterations;
+        printf("BenchTest avg. latency (tid %d): %d ns\n", tid, @bench_latency[tid]);
+        @bench_test_nsec = hist(@bench_latency[tid]);
+    } else {
+        printf("BenchTest latency (tid %d): %d ns\n", tid, @bench_latency[tid]);
+    }
+    delete(@bench_start[tid]);
+}
+
+/* Stream Synchronization Probes */
+usdt:./build/sendrecv_perf:nccl_tests_sdt:stream_sync_cuda_stream_query_start
+{
+    @stream_sync_start[tid] = nsecs; // Start timestamp for stream sync
+}
+
+usdt:./build/sendrecv_perf:nccl_tests_sdt:stream_sync_cuda_stream_query_stop
+/(@stream_sync_start[tid] != 0)/
+{
+    @stream_sync_latency[tid] = nsecs - @stream_sync_start[tid];
+    printf("StreamSync latency (tid %d): %d ns\n", tid, @stream_sync_latency[tid]);
+    delete(@stream_sync_start[tid]);
+}
+
+
+usdt:./build/sendrecv_perf:nccl_tests_sdt:barrier_start
+{
+    @barrier_start[tid] = nsecs; 
+}
+
+usdt:./build/sendrecv_perf:nccl_tests_sdt:barrier_stop
+/(@barrier_start[tid] != 0)/
+{
+    @barrier_start_latency[tid] = nsecs - @barrier_start[tid];
+    printf("Barrier latency (tid %d): %d ns\n", tid, @barrier_start_latency[tid]);
+    @barrier_nsec = hist(@barrier_start_latency[tid]);
+    delete(@barrier_start[tid]);
+}
+
+usdt:./build/sendrecv_perf:nccl_tests_sdt:start_coll_start
+{
+    @start_coll_start[tid] = nsecs; 
+}
+
+usdt:./build/sendrecv_perf:nccl_tests_sdt:start_coll_stop
+/(@start_coll_start[tid] != 0)/
+{
+    @start_coll_latency[tid] = nsecs - @start_coll_start[tid];
+    printf("StartColl latency (tid %d): %d ns\n", tid, @start_coll_latency[tid]);
+    @start_coll_nsec = hist(@start_coll_latency[tid]);
+    delete(@start_coll_start[tid]);
+}

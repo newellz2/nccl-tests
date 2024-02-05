@@ -4,6 +4,7 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include "nccl_tests_std.h"
 #include "common.h"
 #include <pthread.h>
 #include <cstdio>
@@ -141,6 +142,7 @@ void Barrier(struct threadArgs *args) {
   static pthread_cond_t cond[2] = {PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER};
   static int counter[2] = {0, 0};
 
+  NCCL_TESTS_SDT_BARRIER_START(args->nThreads);
   pthread_mutex_lock(&lock[epoch]);
   if(++counter[epoch] == args->nThreads)
     pthread_cond_broadcast(&cond[epoch]);
@@ -160,6 +162,8 @@ void Barrier(struct threadArgs *args) {
   }
   pthread_mutex_unlock(&lock[epoch]);
   epoch ^= 1;
+  NCCL_TESTS_SDT_BARRIER_STOP(epoch);
+
 }
 
 // Inter-thread/process barrier+allreduce. The quality of the return value
@@ -271,6 +275,8 @@ testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t* comms) {
   cudaError_t cudaErr;
   int remaining = ngpus;
+  NCCL_TESTS_SDT_STREAM_SYNC_CUDA_STEAM_QUERY_START(remaining);
+
   int* done = (int*)malloc(sizeof(int)*ngpus);
   memset(done, 0, sizeof(int)*ngpus);
   timer tim;
@@ -278,9 +284,15 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
   while (remaining) {
    int idle = 1;
    for (int i=0; i<ngpus; i++) {
-     if (done[i]) continue;
 
+     if (done[i]) { 
+        continue; 
+      };
+
+     NCCL_TESTS_SDT_STREAM_SYNC_CUDA_STEAM_QUERY_START(i);
      cudaErr = cudaStreamQuery(streams[i]);
+     NCCL_TESTS_SDT_STREAM_SYNC_CUDA_STEAM_QUERY_STOP(i);
+
      if (cudaErr == cudaSuccess) {
        done[i] = 1;
        remaining--;
@@ -323,6 +335,8 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
    if (idle) sched_yield();
   }
   free(done);
+  NCCL_TESTS_SDT_STREAM_SYNC_CUDA_STEAM_QUERY_STOP(remaining);
+
   return testSuccess;
 }
 
@@ -333,6 +347,8 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   size_t totalnbytes = max(args->sendBytes, args->expectedBytes);
   size_t steps = totalnbytes ? args->maxbytes / totalnbytes : 1;
   size_t shift = totalnbytes * (iter % steps);
+
+  NCCL_TESTS_SDT_START_COLL_START(iter);
 
   if (args->nGpus > 1) NCCLCHECK(ncclGroupStart());
   for (int i = 0; i < args->nGpus; i++) {
@@ -392,6 +408,7 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     TESTCHECK(testStreamSynchronize(args->nGpus, args->streams, args->comms));
   }
   if (blocking_coll) Barrier(args);
+  NCCL_TESTS_SDT_START_COLL_STOP(iter);
   return testSuccess;
 }
 
@@ -432,6 +449,7 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   // Performance Benchmark
   timer tim;
+
   for (int iter = 0; iter < iters; iter++) {
     if (agg_iters>1) NCCLCHECK(ncclGroupStart());
     for (int aiter = 0; aiter < agg_iters; aiter++) {
@@ -439,6 +457,7 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     }
     if (agg_iters>1) NCCLCHECK(ncclGroupEnd());
   }
+
 
 #if CUDART_VERSION >= 11030
   if (cudaGraphLaunches >= 1) {
@@ -462,7 +481,10 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 #endif
 
   double cputimeSec = tim.elapsed()/(iters*agg_iters);
+
+  NCCL_TESTS_SDT_BENCH_TEST_START(iters*agg_iters);
   TESTCHECK(completeColl(args));
+  NCCL_TESTS_SDT_BENCH_TEST_STOP(iters*agg_iters);
 
   double deltaSec = tim.elapsed();
   deltaSec = deltaSec/(iters*agg_iters);
@@ -1056,6 +1078,7 @@ testResult_t run() {
   PRINT("# Avg bus bandwidth    : %g %s\n", bw[0], check_avg_bw == -1 ? "" : (bw[0] < check_avg_bw*(0.9) ? "FAILED" : "OK"));
   PRINT("#\n");
 #ifdef MPI_SUPPORT
+  MPI_Comm_free(&mpi_comm);
   MPI_Finalize();
 #endif
 
