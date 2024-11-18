@@ -12,6 +12,7 @@
 #include <getopt.h>
 #include <libgen.h>
 #include "cuda.h"
+#include <time.h>
 
 #include "../verifiable/verifiable.h"
 
@@ -66,6 +67,9 @@ static size_t minBytes = 32*1024*1024;
 static size_t maxBytes = 32*1024*1024;
 static size_t stepBytes = 1*1024*1024;
 static size_t stepFactor = 1;
+static int duration = 0;
+static int loopLimit = 0;
+static char rankdataFile[100];
 static int datacheck = 1;
 static int warmup_iters = 5;
 static int iters = 20;
@@ -450,6 +454,7 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   // Performance Benchmark
   timer tim;
 
+  NCCL_TESTS_SDT_BENCH_TEST_START(iters*agg_iters);
   for (int iter = 0; iter < iters; iter++) {
     if (agg_iters>1) NCCLCHECK(ncclGroupStart());
     for (int aiter = 0; aiter < agg_iters; aiter++) {
@@ -482,14 +487,56 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   double cputimeSec = tim.elapsed()/(iters*agg_iters);
 
-  NCCL_TESTS_SDT_BENCH_TEST_START(iters*agg_iters);
   TESTCHECK(completeColl(args));
   NCCL_TESTS_SDT_BENCH_TEST_STOP(iters*agg_iters);
 
   double deltaSec = tim.elapsed();
   deltaSec = deltaSec/(iters*agg_iters);
   if (cudaGraphLaunches >= 1) deltaSec = deltaSec/cudaGraphLaunches;
+
+  double deltaSecMin = deltaSec;
+  double deltaSecMax = deltaSec;
+
+  #ifdef MPI_SUPPORT
+
+  rankTiming *rankTimings = (args->proc == 0) ? (rankTiming *)malloc(args->nProcs * sizeof(rankTiming)) : NULL;
+
+  rankTiming rt;
+  rt.rank = args->proc;
+  rt.timing = deltaSec;
+
+  // Gather the structures
+  MPI_Gather(&rt, sizeof(rankTiming), MPI_BYTE, rankTimings, sizeof(rankTiming), MPI_BYTE, 0, MPI_COMM_WORLD); 
+
+  if (args->proc == 0) { 
+
+    if (args->rankdataFile != nullptr || strlen(args->rankdataFile) > 0) { 
+      struct timespec ts;
+      timespec_get(&ts, TIME_UTC);
+
+      FILE *fp = fopen(args->rankdataFile, "a");
+      if (fp != NULL) {
+        
+        for (int i = 0; i < args->nProcs; i++){
+          fprintf(fp, "%ld.%ld,%d,%f\n", ts.tv_sec, ts.tv_nsec, rankTimings[i].rank, rankTimings[i].timing); 
+        }
+
+        fclose(fp);
+      }
+      free(rankTimings); 
+    }
+  }
+
+  #endif
   Allreduce(args, &deltaSec, average);
+  Allreduce(args, &deltaSecMin, 2);
+  Allreduce(args, &deltaSecMax, 3);
+
+  double times[3];
+  times[0] = deltaSec;
+  times[1] = deltaSecMin;
+  times[2] = deltaSecMax;
+  
 
 #if CUDART_VERSION >= 11030
   if (cudaGraphLaunches >= 1) {
@@ -501,9 +548,11 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
 #endif
 
-  double algBw, busBw;
-  args->collTest->getBw(count, wordSize(type), deltaSec, &algBw, &busBw, args->nProcs*args->nThreads*args->nGpus);
+  double algBw[3], busBw[3];
 
+  for (int i = 0; i < 3; i++) {
+    args->collTest->getBw(count, wordSize(type), times[i], &algBw[i], &busBw[i], args->nProcs*args->nThreads*args->nGpus);
+  }
   Barrier(args);
 
   int64_t wrongElts = 0;
@@ -564,22 +613,26 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       if (wrongElts) break;
   }
 
-  double timeUsec = (report_cputime ? cputimeSec : deltaSec)*1.0E6;
-  char timeStr[100];
-  if (timeUsec >= 10000.0) {
-    sprintf(timeStr, "%7.0f", timeUsec);
-  } else if (timeUsec >= 100.0) {
-    sprintf(timeStr, "%7.1f", timeUsec);
-  } else {
-    sprintf(timeStr, "%7.2f", timeUsec);
-  }
-  if (args->reportErrors) {
-    PRINT("  %7s  %6.2f  %6.2f  %5g", timeStr, algBw, busBw, (double)wrongElts);
-  } else {
-    PRINT("  %7s  %6.2f  %6.2f  %5s", timeStr, algBw, busBw, "N/A");
+  char timeStrs[3][100];
+
+  for(int i = 0; i < 3; i++){
+    double timeUsec = (report_cputime ? cputimeSec : times[i])*1.0E6;
+    if (timeUsec >= 10000.0) {
+      sprintf(timeStrs[i], "%.0f", timeUsec);
+    } else if (timeUsec >= 100.0) {
+      sprintf(timeStrs[i], "%.1f", timeUsec);
+    } else {
+      sprintf(timeStrs[i], "%.2f", timeUsec);
+    }
   }
 
-  args->bw[0] += busBw;
+  if (args->reportErrors) {
+    PRINT("  %s:%s:%s  %.2f:%.2f:%.2f  %.2f:%.2f:%.2f  %5g", timeStrs[0], timeStrs[1], timeStrs[2], algBw[0], algBw[1], algBw[2], busBw[0], busBw[1], busBw[2], (double)wrongElts);
+  } else {
+    PRINT("  %s:%s:%s  %.2f:%.2f:%.2f  %.2f:%.2f:%.2f  %5s", timeStrs[0], timeStrs[1], timeStrs[2], algBw[0], algBw[1], algBw[2], busBw[0], busBw[1], busBw[2], "N/A");
+  }
+
+  args->bw[0] += busBw[0];
   args->bw_count[0]++;
   return testSuccess;
 }
@@ -615,16 +668,36 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
     TESTCHECK(startColl(args, type, op, root, 0, iter));
   }
   TESTCHECK(completeColl(args));
+  
+  int loopCount = 0;
+  struct timespec ts;
+
+  timespec_get(&ts, TIME_UTC);
+  long start =  ts.tv_sec;
 
   // Benchmark
   for (size_t size = args->minbytes; size<=args->maxbytes; size = ((args->stepfactor > 1) ? size*args->stepfactor : size+args->stepbytes)) {
       setupArgs(size, type, args);
       char rootName[100];
+      timespec_get(&ts, TIME_UTC);
       sprintf(rootName, "%6i", root);
-      PRINT("%12li  %12li  %8s  %6s  %6s", max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, rootName);
+      PRINT("%-10d %10ld.%-9ld  %12ld  %12li  %8s  %6s  %6s", loopCount, ts.tv_sec, ts.tv_nsec, 
+                max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, rootName);
       TESTCHECK(BenchTime(args, type, op, root, 0));
       TESTCHECK(BenchTime(args, type, op, root, 1));
       PRINT("\n");
+      loopCount++;
+      if (args->duration > 0) {
+        long diff = ts.tv_sec - start;
+        if (diff > args->duration) {
+          break;
+        }
+      }
+      if (args->loopLimit > 0 ){
+        if (loopCount >= args->loopLimit) {
+          break;
+        }
+      }
   }
   return testSuccess;
 }
@@ -713,6 +786,9 @@ int main(int argc, char* argv[]) {
     {"ngpus", required_argument, 0, 'g'},
     {"minbytes", required_argument, 0, 'b'},
     {"maxbytes", required_argument, 0, 'e'},
+    {"duration", required_argument, 0, 'D'},
+    {"loop_limit", required_argument, 0, 'L'},
+    {"rankdata_file", required_argument, 0, 'R'},
     {"stepbytes", required_argument, 0, 'i'},
     {"stepfactor", required_argument, 0, 'f'},
     {"iters", required_argument, 0, 'n'},
@@ -735,7 +811,7 @@ int main(int argc, char* argv[]) {
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:p:c:o:d:r:z:y:T:hG:C:a:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:D:L:R:i:f:n:m:w:p:c:o:d:r:z:y:T:hG:C:a:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -762,6 +838,16 @@ int main(int argc, char* argv[]) {
           return -1;
         }
         maxBytes = (size_t)parsed;
+        break;
+      case 'D':
+        duration = strtol(optarg, NULL, 0);
+        break;
+      case 'L':
+        loopLimit = strtol(optarg, NULL, 0);
+        break;
+      case 'R':
+        strncpy(rankdataFile, optarg, sizeof(rankdataFile) - 1);
+        rankdataFile[sizeof(rankdataFile) - 1] = '\0';
         break;
       case 'i':
         stepBytes = strtol(optarg, NULL, 0);
@@ -830,6 +916,9 @@ int main(int argc, char* argv[]) {
             "[-i,--stepbytes <increment size>] \n\t"
             "[-f,--stepfactor <increment factor>] \n\t"
             "[-n,--iters <iteration count>] \n\t"
+            "[-D,--duration <seconds>] \n\t"
+            "[-L,--loop_limit <int>] \n\t"
+            "[-R,--rankdata_file <filename>] \n\t"
             "[-m,--agg_iters <aggregated iteration count>] \n\t"
             "[-w,--warmup_iters <warmup iteration count>] \n\t"
             "[-p,--parallel_init <0/1>] \n\t"
@@ -894,10 +983,10 @@ testResult_t run() {
 #endif
   is_main_thread = is_main_proc = (proc == 0) ? 1 : 0;
 
-  PRINT("# nThread %d nGpus %d minBytes %ld maxBytes %ld step: %ld(%s) warmup iters: %d iters: %d agg iters: %d validation: %d graph: %d\n",
+  PRINT("# nThread %d nGpus %d minBytes %ld maxBytes %ld step: %ld(%s) warmup iters: %d iters: %d agg iters: %d validation: %d graph: %d duration: %d loop_limit: %d\n",
         nThreads, nGpus, minBytes, maxBytes,
         (stepFactor > 1)?stepFactor:stepBytes, (stepFactor > 1)?"factor":"bytes",
-        warmup_iters, iters, agg_iters, datacheck, cudaGraphLaunches);
+        warmup_iters, iters, agg_iters, datacheck, cudaGraphLaunches, duration, loopLimit);
   if (blocking_coll) PRINT("# Blocking Enabled: wait for completion and barrier after each collective \n");
   if (parallel_init) PRINT("# Parallel Init Enabled: threads call into NcclInitRank concurrently \n");
   PRINT("#\n");
@@ -999,9 +1088,9 @@ testResult_t run() {
   const char* timeStr = report_cputime ? "cputime" : "time";
   PRINT("#\n");
   PRINT("# %10s  %12s  %8s  %6s  %6s           out-of-place                       in-place          \n", "", "", "", "", "");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s %6s  %7s  %6s  %6s %6s\n", "size", "count", "type", "redop", "root",
+  PRINT("# %9s  %18s  %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s %6s  %7s  %6s  %6s %6s\n","id", "ts", "size", "count", "type", "redop", "root",
       timeStr, "algbw", "busbw", "#wrong", timeStr, "algbw", "busbw", "#wrong");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %5s  %7s  %6s  %6s  %5s\n", "(B)", "(elements)", "", "", "",
+  PRINT("# %9s  %18s  %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %5s  %7s  %6s  %6s  %5s\n", "", "", "(B)", "(elements)", "", "", "",
       "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(GB/s)", "(GB/s)", "");
 
   struct testThread threads[nThreads];
@@ -1013,6 +1102,9 @@ testResult_t run() {
     threads[t].args.stepbytes=stepBytes;
     threads[t].args.stepfactor=stepFactor;
     threads[t].args.localRank = localRank;
+    threads[t].args.duration = duration;
+    threads[t].args.loopLimit = loopLimit;
+    threads[t].args.rankdataFile = strdup(rankdataFile);
 
     threads[t].args.totalProcs=totalProcs;
     threads[t].args.nProcs=ncclProcs;

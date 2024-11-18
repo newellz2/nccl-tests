@@ -115,7 +115,9 @@ struct threadArgs {
   size_t maxbytes;
   size_t stepbytes;
   size_t stepfactor;
-
+  char* rankdataFile;
+  int duration;
+  int loopLimit;
   int totalProcs;
   int nProcs;
   int proc;
@@ -150,6 +152,11 @@ struct testThread {
   threadFunc_t func;
   struct threadArgs args;
   testResult_t ret;
+};
+
+struct rankTiming {
+  int rank;
+  double timing;
 };
 
 // Provided by common.cu
