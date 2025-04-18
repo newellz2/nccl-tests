@@ -1,0 +1,59 @@
+struct threadArgs {
+  size_t nbytes;
+  size_t minbytes;
+  size_t maxbytes;
+  size_t stepbytes;
+  size_t stepfactor;
+  char* rankDataFile;
+  char* hostname;
+  int duration;
+  int iteration;
+  int loopLimit;
+
+  int totalProcs;
+  int nProcs;
+  int proc;
+  int nThreads;
+  int thread;
+  int nGpus;
+  int* gpus;
+  int localRank;
+  void** sendbuffs;
+  size_t sendBytes;
+  size_t sendInplaceOffset;
+  void** recvbuffs;
+  size_t recvInplaceOffset;
+  char ncclId[128]; // Assuming ncclUniqueId is like NCCL_UNIQUE_ID_BYTES
+  void* comms;      // Use void* for opaque pointers like ncclComm_t*
+  void* streams;    // Use void* for opaque pointers like cudaStream_t*
+
+  void** expected;
+  size_t expectedBytes;
+  int* errors;
+  double* bw;
+  int* bw_count;
+
+  int reportErrors;
+
+  void* collTest; // Use void* for opaque struct testColl*
+};
+
+uprobe:build/all_reduce_perf:startColl
+{
+    $args = (struct threadArgs *)arg0;
+    @coll_start[tid] = nsecs; // Start
+    @coll_proc[tid] = $args->proc;
+    @coll_thread[tid] = $args->thread;
+}
+
+uretprobe:build/all_reduce_perf:startColl
+/(@coll_start[tid] != 0)/
+{
+
+    @coll_timing[tid] = nsecs - @coll_start[tid];
+    $proc = @coll_proc[tid];
+    $thread = @coll_thread[tid];
+
+    printf("startColl timing (tid %d): %dns thread: %d pid: %d\n", tid, @coll_timing[tid], $proc, pid);
+    delete(@coll_start[tid]);
+}

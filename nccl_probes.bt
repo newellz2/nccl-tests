@@ -1,0 +1,14 @@
+uprobe:/opt/nvhpc/251/Linux_x86_64/25.1/comm_libs/nccl/lib/libnccl.so.2:ncclBroadcast
+{
+    @coll_start[tid] = nsecs; // Start
+}
+
+uretprobe:/opt/nvhpc/251/Linux_x86_64/25.1/comm_libs/nccl/lib/libnccl.so.2:ncclBroadcast
+/(@coll_start[tid] != 0)/
+{
+
+    @coll_timing[tid] = nsecs - @coll_start[tid];
+
+    printf("startColl timing - tid: %d pid: %d timing: %dns \n", tid, pid, @coll_timing[tid]);
+    delete(@coll_start[tid]);
+}

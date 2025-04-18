@@ -7,11 +7,13 @@
 #include "common.h"
 #include <pthread.h>
 #include <cstdio>
+#include <signal.h>
 #include <type_traits>
 #include <getopt.h>
 #include <libgen.h>
 #include <string.h>
 #include <ctype.h>
+#include <atomic>
 #include "cuda.h"
 
 #include "../verifiable/verifiable.h"
@@ -60,6 +62,8 @@ extern "C" __attribute__((weak)) char const* ncclGetLastError(ncclComm_t comm) {
 int is_main_proc = 0;
 thread_local int is_main_thread = 0;
 
+std::atomic<int> global_terminate(0);
+
 // Command line parameter defaults
 static int nThreads = 1;
 static int nGpus = 1;
@@ -67,6 +71,9 @@ static size_t minBytes = 32*1024*1024;
 static size_t maxBytes = 32*1024*1024;
 static size_t stepBytes = 1*1024*1024;
 static size_t stepFactor = 1;
+static int duration = 0;
+static int loopLimit = 0;
+static char rankDataFile[1024];
 static int datacheck = 1;
 static int warmup_iters = 5;
 static int iters = 20;
@@ -88,6 +95,13 @@ static int local_register = 0;
 #endif
 
 #define NUM_BLOCKS 32
+
+void sigterm_handler(int signum) {
+  if (signum == SIGTERM) {
+      global_terminate = 1;
+      fprintf(stderr, "\nSIGTERM received, initiating graceful shutdown...\n");
+  }
+}
 
 static double parsesize(const char *value) {
     long long int units;
@@ -379,7 +393,6 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       NCCLCHECK(ncclRedOpCreatePreMulSum(&op, &u64, type, ncclScalarHostImmediate, args->comms[i]));
     }
     #endif
-
     TESTCHECK(args->collTest->runColl(
           (void*)(in_place ? recvBuff + args->sendInplaceOffset*rank : sendBuff),
           (void*)(in_place ? recvBuff + args->recvInplaceOffset*rank : recvBuff),
@@ -471,9 +484,105 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   TESTCHECK(completeColl(args));
 
   double deltaSec = tim.elapsed();
+  
+  //For the min and max
+  double deltaSecMin = deltaSec;
+  double deltaSecMax = deltaSec;
+
   deltaSec = deltaSec/(iters*agg_iters);
   if (cudaGraphLaunches >= 1) deltaSec = deltaSec/cudaGraphLaunches;
+
+  //Get all rank data
+  #ifdef MPI_SUPPORT
+
+  char globalMinHost[1024] = {0};
+  char globalMaxHost[1024] = {0};
+
+  rankTiming *rankTimings = (args->proc == 0) ? (rankTiming *)malloc(args->nProcs * sizeof(rankTiming)) : NULL;
+
+  rankTiming rt;
+  rt.rank = args->proc;
+  rt.timing = deltaSec;
+  snprintf(rt.hostname, sizeof(rt.hostname), "%s:%d", args->hostname, rt.rank);
+
+  // Gather the structures
+  int r  = MPI_Gather(&rt, sizeof(rankTiming), MPI_BYTE, rankTimings, sizeof(rankTiming), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+  if (args->proc == 0 && r == MPI_SUCCESS) {
+
+    double gAlgBw;
+    double gBusBw;
+    int minIndex = 0;
+    int maxIndex = 0;
+
+    if (args->rankDataFile != nullptr && strlen(args->rankDataFile) > 0) {
+      struct timespec ts;
+      timespec_get(&ts, TIME_UTC);
+
+      FILE *fp = fopen(args->rankDataFile, "a");
+      if (fp != NULL) {
+
+
+        for (int i = 0; i < args->nProcs; i++){
+
+          args->collTest->getBw(count, wordSize(type), rankTimings[i].timing, &gAlgBw, &gBusBw, args->nProcs*args->nThreads*args->nGpus);
+
+          fprintf(fp, "%ld.%ld,%s,%d,%f,%f,%f\n",
+                  ts.tv_sec, ts.tv_nsec,
+                  rankTimings[i].hostname,
+                  rankTimings[i].rank,
+                  rankTimings[i].timing,
+                  gAlgBw, gBusBw
+                  );
+
+          if (rankTimings[i].timing < rankTimings[minIndex].timing) {
+              minIndex = i;
+          }
+          if (rankTimings[i].timing > rankTimings[maxIndex].timing) {
+              maxIndex = i;
+          }
+        }
+
+        fclose(fp);
+
+        strncpy(globalMinHost, rankTimings[minIndex].hostname, 1024-1);
+        globalMinHost[1024-1] = '\0';
+        strncpy(globalMaxHost, rankTimings[maxIndex].hostname, 1024-1);
+        globalMaxHost[1024-1] = '\0';
+      }
+      free(rankTimings);
+    } else {
+      for (int i = 0; i < args->nProcs; i++){
+        args->collTest->getBw(count, wordSize(type), rankTimings[i].timing, &gAlgBw, &gBusBw, args->nProcs*args->nThreads*args->nGpus);
+        if (rankTimings[i].timing < rankTimings[minIndex].timing) {
+          minIndex = i;
+        }
+        if (rankTimings[i].timing > rankTimings[maxIndex].timing) {
+          maxIndex = i;
+        }
+      }
+      strncpy(globalMinHost, rankTimings[minIndex].hostname, 1024-1);
+      globalMinHost[1024-1] = '\0';
+      strncpy(globalMaxHost, rankTimings[maxIndex].hostname, 1024-1);
+      globalMaxHost[1024-1] = '\0';
+    }
+  }
+
+  if (r != MPI_SUCCESS) {
+    FPRINTF(stderr, "Gathering Rank Data Filed.\n");
+  }
+
+  #endif
+
+  //Get Avg/Min/Max
   Allreduce(args, &deltaSec, average);
+  Allreduce(args, &deltaSecMin, 2);
+  Allreduce(args, &deltaSecMax, 3);
+
+  double times[3];
+  times[0] = deltaSec;
+  times[1] = deltaSecMin;
+  times[2] = deltaSecMax;
 
 #if CUDART_VERSION >= 11030
   if (cudaGraphLaunches >= 1) {
@@ -485,9 +594,11 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
 #endif
 
-  double algBw, busBw;
-  args->collTest->getBw(count, wordSize(type), deltaSec, &algBw, &busBw, args->nProcs*args->nThreads*args->nGpus);
+  double algBw[3], busBw[3];
 
+  for (int i = 0; i < 3; i++) {
+    args->collTest->getBw(count, wordSize(type), times[i], &algBw[i], &busBw[i], args->nProcs*args->nThreads*args->nGpus);
+  }
   Barrier(args);
 
   int64_t wrongElts = 0;
@@ -549,21 +660,48 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
 
   double timeUsec = (report_cputime ? cputimeSec : deltaSec)*1.0E6;
-  char timeStr[100];
-  if (timeUsec >= 10000.0) {
-    sprintf(timeStr, "%7.0f", timeUsec);
-  } else if (timeUsec >= 100.0) {
-    sprintf(timeStr, "%7.1f", timeUsec);
-  } else {
-    sprintf(timeStr, "%7.2f", timeUsec);
-  }
-  if (args->reportErrors) {
-    PRINT("  %7s  %6.2f  %6.2f  %5g", timeStr, algBw, busBw, (double)wrongElts);
-  } else {
-    PRINT("  %7s  %6.2f  %6.2f  %5s", timeStr, algBw, busBw, "N/A");
+  char timeStrs[3][100];
+
+  for(int i = 0; i < 3; i++){
+    double timeUsec = (report_cputime ? cputimeSec : times[i])*1.0E6;
+    if (timeUsec >= 10000.0) {
+      sprintf(timeStrs[i], "%.0f", timeUsec);
+    } else if (timeUsec >= 100.0) {
+      sprintf(timeStrs[i], "%.1f", timeUsec);
+    } else {
+      sprintf(timeStrs[i], "%.2f", timeUsec);
+    }
   }
 
-  args->bw[0] += busBw;
+  if (args->reportErrors) {
+    PRINT(" %s:%s:%s  %.2f:%.2f:%.2f  %.2f:%.2f:%.2f  %5g  minHost=%s  maxHost=%s",
+          timeStrs[0], timeStrs[1], timeStrs[2],
+          algBw[0], algBw[2], algBw[1],
+          busBw[0], busBw[2], busBw[1],
+          (double)wrongElts,
+  #ifdef MPI_SUPPORT
+          globalMinHost,
+          globalMaxHost
+  #else
+          "N/A", "N/A"
+  #endif
+          );
+  } else {
+    PRINT(" %s:%s:%s  %.2f:%.2f:%.2f  %.2f:%.2f:%.2f  %5s  minHost=%s  maxHost=%s",
+          timeStrs[0], timeStrs[1], timeStrs[2],
+          algBw[0], algBw[2], algBw[1],
+          busBw[0], busBw[2], busBw[1],
+          "N/A",
+  #ifdef MPI_SUPPORT
+          globalMinHost,
+          globalMaxHost
+  #else
+          "N/A", "N/A"
+  #endif
+          );
+  }
+  
+  args->bw[0] += busBw[0];
   args->bw_count[0]++;
   return testSuccess;
 }
@@ -600,18 +738,77 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   }
   TESTCHECK(completeColl(args));
 
+  int loopCount = 0;
+  struct timespec ts;
+  timespec_get(&ts, TIME_UTC);
+  long start =  ts.tv_sec;
+
   // Benchmark
   long repeat = run_cycles;
   do {
     for (size_t size = args->minbytes; size<=args->maxbytes; size = ((args->stepfactor > 1) ? size*args->stepfactor : size+args->stepbytes)) {
       setupArgs(size, type, args);
+      
+      args->iteration = loopCount;
+
       char rootName[100];
       sprintf(rootName, "%6i", root);
-      PRINT("%12li  %12li  %8s  %6s  %6s", max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, rootName);
+      PRINT("Iteration:%-10d %10ld.%-9ld  %12ld  %12li  %8s  %6s  %6s", loopCount, ts.tv_sec, ts.tv_nsec,
+        max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, rootName);
       TESTCHECK(BenchTime(args, type, op, root, 0));
       TESTCHECK(BenchTime(args, type, op, root, 1));
+      long diff = ts.tv_sec - start;
+      if (args->duration > 0) {
+        PRINT(" %d:%d:%d", start, ts.tv_sec, diff);
+      }
       PRINT("\n");
+
+      if (global_terminate) {
+        break;
+      }
+
+      loopCount++;
+
+      if (args->loopLimit > 0 ){
+        if (loopCount >= args->loopLimit) {
+          FPRINTF(stderr, "Loop limit exceeded, exiting loop...\n");
+          global_terminate=1;
+        }
+      }
+
+      #ifdef MPI_SUPPORT
+
+      // All ranks participate in the Bcast, receiving the value.
+      timespec_get(&ts, TIME_UTC);
+      if (args->duration > 0) {
+        diff = ts.tv_sec - start;
+        if (diff >= args->duration) {
+          FPRINTF(stderr, "Duration: Start=%d, Current:%d, Diff:%d\n", start, ts.tv_sec, diff);
+          FPRINTF(stderr, "Duration exceeded, exiting loop...\n", start, ts.tv_sec, diff);
+          global_terminate.store(1, std::memory_order_release);
+        }
+      }
+
+      // All ranks participate in the Bcast, receiving the value from rank 0
+      #if DEBUG_PRINT
+      FPRINTF(stderr, "Rank 0 sending %d\n", (int)global_terminate.load(std::memory_order_relaxed));
+      #endif
+      MPI_Bcast(&global_terminate, 1, MPI_INT, 0, MPI_COMM_WORLD);
+      #if DEBUG_PRINT
+      fprintf(stderr,"BROADCAST: %d received value: %d\n", args->proc, (int)global_terminate.load(std::memory_order_relaxed));
+      #endif
+      if (global_terminate == 1) { //received request
+          break;
+      }
+
     }
+
+    #endif
+
+    if (global_terminate == 1) {
+      break;
+    }
+
   } while (--repeat);
 
   return testSuccess;
@@ -623,8 +820,10 @@ testResult_t threadRunTests(struct threadArgs* args) {
   // exclusive mode those operations will fail.
   CUDACHECK(cudaSetDevice(args->gpus[0]));
   TESTCHECK(ncclTestEngine.runTest(args, ncclroot, (ncclDataType_t)nccltype, test_typenames[nccltype], (ncclRedOp_t)ncclop, test_opnames[ncclop]));
+
   return testSuccess;
 }
+
 
 testResult_t threadInit(struct threadArgs* args) {
   char hostname[1024];
@@ -719,6 +918,9 @@ int main(int argc, char* argv[]) {
     {"ngpus", required_argument, 0, 'g'},
     {"minbytes", required_argument, 0, 'b'},
     {"maxbytes", required_argument, 0, 'e'},
+    {"duration", required_argument, 0, 'D'},  //Duration limit
+    {"loop_limit", required_argument, 0, 'L'}, //Loop limit
+    {"rankdata_file", required_argument, 0, 'K'}, //SendRecv Ranks
     {"stepbytes", required_argument, 0, 'i'},
     {"stepfactor", required_argument, 0, 'f'},
     {"iters", required_argument, 0, 'n'},
@@ -743,7 +945,7 @@ int main(int argc, char* argv[]) {
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:D:L:K:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -770,6 +972,16 @@ int main(int argc, char* argv[]) {
           return -1;
         }
         maxBytes = (size_t)parsed;
+        break;
+        case 'D':
+        duration = strtol(optarg, NULL, 0);
+        break;
+      case 'L':
+        loopLimit = strtol(optarg, NULL, 0);
+        break;
+      case 'K':
+        strncpy(rankDataFile, optarg, sizeof(rankDataFile) - 1);
+        rankDataFile[sizeof(rankDataFile) - 1] = '\0';
         break;
       case 'i':
         parsed = parsesize(optarg);
@@ -964,10 +1176,10 @@ testResult_t run() {
 #endif
   is_main_thread = is_main_proc = (proc == 0) ? 1 : 0;
 
-  PRINT("# nThread %d nGpus %d minBytes %ld maxBytes %ld step: %ld(%s) warmup iters: %d iters: %d agg iters: %d validation: %d graph: %d\n",
+  PRINT("# nThread %d nGpus %d minBytes %ld maxBytes %ld step: %ld(%s) warmup iters: %d iters: %d agg iters: %d validation: %d graph: %d duration: %d loop_limit: %d\n",
         nThreads, nGpus, minBytes, maxBytes,
         (stepFactor > 1)?stepFactor:stepBytes, (stepFactor > 1)?"factor":"bytes",
-        warmup_iters, iters, agg_iters, datacheck, cudaGraphLaunches);
+        warmup_iters, iters, agg_iters, datacheck, cudaGraphLaunches, duration, loopLimit);
   if (blocking_coll) PRINT("# Blocking Enabled: wait for completion and barrier after each collective \n");
   if (parallel_init) PRINT("# Parallel Init Enabled: threads call into NcclInitRank concurrently \n");
   PRINT("#\n");
@@ -1081,9 +1293,9 @@ testResult_t run() {
   const char* timeStr = report_cputime ? "cputime" : "time";
   PRINT("#\n");
   PRINT("# %10s  %12s  %8s  %6s  %6s           out-of-place                       in-place          \n", "", "", "", "", "");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s %6s  %7s  %6s  %6s %6s\n", "size", "count", "type", "redop", "root",
+  PRINT("# %9s  %18s  %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s %6s  %7s  %6s  %6s %6s\n","id", "ts", "size", "count", "type", "redop", "root",
       timeStr, "algbw", "busbw", "#wrong", timeStr, "algbw", "busbw", "#wrong");
-  PRINT("# %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %5s  %7s  %6s  %6s  %5s\n", "(B)", "(elements)", "", "", "",
+  PRINT("# %9s  %18s  %10s  %12s  %8s  %6s  %6s  %7s  %6s  %6s  %5s  %7s  %6s  %6s  %5s\n", "", "", "(B)", "(elements)", "", "", "",
       "(us)", "(GB/s)", "(GB/s)", "", "(us)", "(GB/s)", "(GB/s)", "");
 
   struct testThread threads[nThreads];
@@ -1095,6 +1307,12 @@ testResult_t run() {
     threads[t].args.stepbytes=stepBytes;
     threads[t].args.stepfactor=stepFactor;
     threads[t].args.localRank = localRank;
+    //Additional variables
+    threads[t].args.duration = duration;
+    threads[t].args.loopLimit = loopLimit;
+    threads[t].args.iteration = 0;
+    threads[t].args.rankDataFile = strdup(rankDataFile);
+    threads[t].args.hostname = strdup(hostname);
 
     threads[t].args.totalProcs=totalProcs;
     threads[t].args.nProcs=ncclProcs;
