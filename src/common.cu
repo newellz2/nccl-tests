@@ -74,6 +74,7 @@ static size_t stepFactor = 1;
 static int duration = 0;
 static int loopLimit = 0;
 static char rankDataFile[1024];
+static int rotateSendRecv = 0;
 static int datacheck = 1;
 static int warmup_iters = 5;
 static int iters = 20;
@@ -394,6 +395,7 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     }
     #endif
     TESTCHECK(args->collTest->runColl(
+          args,
           (void*)(in_place ? recvBuff + args->sendInplaceOffset*rank : sendBuff),
           (void*)(in_place ? recvBuff + args->recvInplaceOffset*rank : recvBuff),
         count, type, op, root, args->comms[i], args->streams[i]));
@@ -522,14 +524,14 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       FILE *fp = fopen(args->rankDataFile, "a");
       if (fp != NULL) {
 
-
         for (int i = 0; i < args->nProcs; i++){
 
           args->collTest->getBw(count, wordSize(type), rankTimings[i].timing, &gAlgBw, &gBusBw, args->nProcs*args->nThreads*args->nGpus);
 
-          fprintf(fp, "%ld.%ld,%s,%d,%f,%f,%f\n",
+          fprintf(fp, "%ld.%ld,%s,%d,%d,%f,%f,%f\n",
                   ts.tv_sec, ts.tv_nsec,
                   rankTimings[i].hostname,
+                  root,
                   rankTimings[i].rank,
                   rankTimings[i].timing,
                   gAlgBw, gBusBw
@@ -550,7 +552,6 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
         strncpy(globalMaxHost, rankTimings[maxIndex].hostname, 1024-1);
         globalMaxHost[1024-1] = '\0';
       }
-      free(rankTimings);
     } else {
       for (int i = 0; i < args->nProcs; i++){
         args->collTest->getBw(count, wordSize(type), rankTimings[i].timing, &gAlgBw, &gBusBw, args->nProcs*args->nThreads*args->nGpus);
@@ -565,11 +566,17 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       globalMinHost[1024-1] = '\0';
       strncpy(globalMaxHost, rankTimings[maxIndex].hostname, 1024-1);
       globalMaxHost[1024-1] = '\0';
+
     }
+
   }
 
   if (r != MPI_SUCCESS) {
-    FPRINTF(stderr, "Gathering Rank Data Filed.\n");
+    FPRINTF(stderr, "Gathering Rank Data Failed.\n");
+  }
+
+  if (args->proc == 0) {
+    free(rankTimings);
   }
 
   #endif
@@ -738,6 +745,7 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   }
   TESTCHECK(completeColl(args));
 
+  int rotatedRoot = 0;
   int loopCount = 0;
   struct timespec ts;
   timespec_get(&ts, TIME_UTC);
@@ -751,12 +759,24 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
       
       args->iteration = loopCount;
 
+      rotatedRoot = loopCount % args->nProcs;
+
       char rootName[100];
-      sprintf(rootName, "%6i", root);
+      sprintf(rootName, "%6i", rotatedRoot);
       PRINT("Iteration:%-10d %10ld.%-9ld  %12ld  %12li  %8s  %6s  %6s", loopCount, ts.tv_sec, ts.tv_nsec,
         max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, rootName);
-      TESTCHECK(BenchTime(args, type, op, root, 0));
-      TESTCHECK(BenchTime(args, type, op, root, 1));
+
+      TESTCHECK(BenchTime(args, type, op, rotatedRoot, 0));
+      TESTCHECK(BenchTime(args, type, op, rotatedRoot, 1));
+
+      if (args->rotateSendRecv){
+        if (args->rotationPosition == args->nProcs-1){
+          args->rotationPosition = 1;
+        } else {
+          args->rotationPosition += 1;
+        }
+      }
+
       long diff = ts.tv_sec - start;
       if (args->duration > 0) {
         PRINT(" %d:%d:%d", start, ts.tv_sec, diff);
@@ -945,7 +965,7 @@ int main(int argc, char* argv[]) {
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:D:L:K:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:D:L:K:O:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -982,6 +1002,9 @@ int main(int argc, char* argv[]) {
       case 'K':
         strncpy(rankDataFile, optarg, sizeof(rankDataFile) - 1);
         rankDataFile[sizeof(rankDataFile) - 1] = '\0';
+        break;
+      case 'O':
+        rotateSendRecv = strtol(optarg, NULL, 0);
         break;
       case 'i':
         parsed = parsesize(optarg);
@@ -1312,6 +1335,8 @@ testResult_t run() {
     threads[t].args.loopLimit = loopLimit;
     threads[t].args.iteration = 0;
     threads[t].args.rankDataFile = strdup(rankDataFile);
+    threads[t].args.rotateSendRecv = rotateSendRecv;
+    threads[t].args.rotationPosition = 1;
     threads[t].args.hostname = strdup(hostname);
 
     threads[t].args.totalProcs=totalProcs;

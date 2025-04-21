@@ -91,8 +91,10 @@ struct testColl {
   testResult_t (*initData)(struct threadArgs* args, ncclDataType_t type,
       ncclRedOp_t op, int root, int rep, int in_place);
   void (*getBw)(size_t count, int typesize, double sec, double* algBw, double* busBw, int nranks);
-  testResult_t (*runColl)(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type,
-      ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream);
+  testResult_t (*runColl)(
+    struct threadArgs* args,
+    void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type,
+    ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream);
 };
 extern struct testColl allReduceTest;
 extern struct testColl allGatherTest;
@@ -115,11 +117,6 @@ struct rankTiming {
   char hostname[1024];
 };
 
-struct rankInfo {
-    int rank;
-    char hostname[1024];
-};
-
 struct threadArgs {
   size_t nbytes;
   size_t minbytes;
@@ -131,6 +128,8 @@ struct threadArgs {
   int duration;
   int iteration;
   int loopLimit;
+  int rotateSendRecv;
+  int rotationPosition;
 
   int totalProcs;
   int nProcs;

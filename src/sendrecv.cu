@@ -26,7 +26,13 @@ testResult_t SendRecvInitData(struct threadArgs* args, ncclDataType_t type, nccl
     CUDACHECK(cudaMemset(args->recvbuffs[i], 0, args->expectedBytes));
     void* data = in_place ? args->recvbuffs[i] : args->sendbuffs[i];
     TESTCHECK(InitData(data, sendcount, rank*sendcount, type, ncclSum, rep, 1, 0));
-    int peer = (rank-1+nranks)%nranks;
+    int peer = 0;
+    if (args->rotateSendRecv) {
+      peer = rank ^ args->rotationPosition;
+    } else {
+      peer = (rank-1+nranks)%nranks;
+    }
+
     TESTCHECK(InitData(args->expected[i], recvcount, peer*recvcount, type, ncclSum, rep, 1, 0));
     CUDACHECK(cudaDeviceSynchronize());
   }
@@ -43,14 +49,23 @@ void SendRecvGetBw(size_t count, int typesize, double sec, double* algBw, double
   *busBw = baseBw * factor;
 }
 
-testResult_t SendRecvRunColl(void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
+testResult_t SendRecvRunColl(struct threadArgs* args, void* sendbuff, void* recvbuff, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream) {
   int nRanks;
   NCCLCHECK(ncclCommCount(comm, &nRanks));
   int rank;
   NCCLCHECK(ncclCommUserRank(comm, &rank));
-  int recvPeer = (rank-1+nRanks) % nRanks;
-  int sendPeer = (rank+1) % nRanks;
+  int recvPeer = 0;
+  int sendPeer = 0;
 
+  if (args->rotateSendRecv) {
+    recvPeer = rank ^ args->rotationPosition;
+    sendPeer = rank ^ args->rotationPosition;
+  } else {
+    recvPeer = (rank-1+nRanks) % nRanks;
+    sendPeer = (rank+1) % nRanks;
+  }
+
+  //fprintf(stderr, "RUNCOLL: rank: %d, recvPeer: %d, sendPeer: %d\n", rank, recvPeer, sendPeer);
   NCCLCHECK(ncclGroupStart());
   NCCLCHECK(ncclSend(sendbuff, count, type, sendPeer, comm, stream));
   NCCLCHECK(ncclRecv(recvbuff, count, type, recvPeer, comm, stream));
