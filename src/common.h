@@ -113,13 +113,27 @@ struct testEngine {
 
 extern struct testEngine ncclTestEngine;
 
+struct rankTiming {
+  int rank;
+  double timing;
+  char hostname[1024];
+};
+
+struct rankInfo {
+    int rank;
+    char hostname[1024];
+};
+
 struct threadArgs {
   size_t nbytes;
   size_t minbytes;
   size_t maxbytes;
   size_t stepbytes;
   size_t stepfactor;
-
+  char* rankDataFile;
+  char* hostname;
+  int iteration;
+  
   int totalProcs;
   int nProcs;
   int proc;
@@ -165,11 +179,16 @@ struct testThread {
 };
 
 // Provided by common.cu
-extern void Barrier(struct threadArgs* args);
-extern testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* typeName, ncclRedOp_t op,  const char* opName, int root);
-extern testResult_t InitDataReduce(void* data, const size_t count, const size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks);
-extern testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks, const int rank);
-extern void AllocateBuffs(void **sendbuff, void **recvbuff, void **expected, void **expectedHost, size_t nbytes, int nranks);
+extern "C"  void Barrier(struct threadArgs* args);
+extern "C"  testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* typeName, ncclRedOp_t op,  const char* opName, int root);
+extern "C"  testResult_t InitDataReduce(void* data, const size_t count, const size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks);
+extern "C"  testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataType_t type, ncclRedOp_t op, const uint64_t seed, const int nranks, const int rank);
+extern "C"  void AllocateBuffs(void **sendbuff, void **recvbuff, void **expected, void **expectedHost, size_t nbytes, int nranks);
+
+// Include these for uprobes
+extern "C" testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t opIndex, int root, int in_place, int iter);
+extern "C" testResult_t completeColl(struct threadArgs* args);
+extern "C" testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place);
 
 #include <unistd.h>
 
@@ -314,6 +333,7 @@ static int ncclstringtoop (char *str) {
 extern int is_main_proc;
 extern thread_local int is_main_thread;
 #define PRINT if (is_main_thread) printf
+#define FPRINTF if (is_main_thread) fprintf
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
 template <typename F>

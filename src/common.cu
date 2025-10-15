@@ -82,6 +82,7 @@ static size_t minBytes = 32*1024*1024;
 static size_t maxBytes = 32*1024*1024;
 static size_t stepBytes = 1*1024*1024;
 static size_t stepFactor = 1;
+static char rankDataFile[1024];
 static int datacheck = 1;
 static int warmup_iters = 1;
 static int iters = 20;
@@ -515,9 +516,105 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   TESTCHECK(completeColl(args));
 
   double deltaSec = tim.elapsed();
+
+  //For the min and max
+  double deltaSecMin = deltaSec;
+  double deltaSecMax = deltaSec;
+
   deltaSec = deltaSec/(iters*agg_iters);
   if (cudaGraphLaunches >= 1) deltaSec = deltaSec/cudaGraphLaunches;
+
+//Get all rank data
+#ifdef MPI_SUPPORT
+
+  char globalMinHost[1024] = {0};
+  char globalMaxHost[1024] = {0};
+
+  rankTiming *rankTimings = (args->proc == 0) ? (rankTiming *)malloc(args->nProcs * sizeof(rankTiming)) : NULL;
+
+  rankTiming rt;
+  rt.rank = args->proc;
+  rt.timing = deltaSec;
+  snprintf(rt.hostname, sizeof(rt.hostname), "%s:%d", args->hostname, rt.rank);
+
+  // Gather the structures
+  int r  = MPI_Gather(&rt, sizeof(rankTiming), MPI_BYTE, rankTimings, sizeof(rankTiming), MPI_BYTE, 0, MPI_COMM_WORLD);
+
+  if (args->proc == 0 && r == MPI_SUCCESS) {
+
+    double gAlgBw;
+    double gBusBw;
+    int minIndex = 0;
+    int maxIndex = 0;
+
+    if (args->rankDataFile != nullptr && strlen(args->rankDataFile) > 0) {
+      struct timespec ts;
+      timespec_get(&ts, TIME_UTC);
+
+      FILE *fp = fopen(args->rankDataFile, "a");
+      if (fp != NULL) {
+
+
+        for (int i = 0; i < args->nProcs; i++){
+
+          args->collTest->getBw(count, wordSize(type), rankTimings[i].timing, &gAlgBw, &gBusBw, args->nProcs*args->nThreads*args->nGpus);
+
+          fprintf(fp, "%ld.%ld,%s,%d,%f,%f,%f\n",
+                  ts.tv_sec, ts.tv_nsec,
+                  rankTimings[i].hostname,
+                  rankTimings[i].rank,
+                  rankTimings[i].timing,
+                  gAlgBw, gBusBw
+                  );
+
+          if (rankTimings[i].timing < rankTimings[minIndex].timing) {
+              minIndex = i;
+          }
+          if (rankTimings[i].timing > rankTimings[maxIndex].timing) {
+              maxIndex = i;
+          }
+        }
+
+        fclose(fp);
+
+        strncpy(globalMinHost, rankTimings[minIndex].hostname, 1024-1);
+        globalMinHost[1024-1] = '\0';
+        strncpy(globalMaxHost, rankTimings[maxIndex].hostname, 1024-1);
+        globalMaxHost[1024-1] = '\0';
+      }
+      free(rankTimings);
+    } else {
+      for (int i = 0; i < args->nProcs; i++){
+        args->collTest->getBw(count, wordSize(type), rankTimings[i].timing, &gAlgBw, &gBusBw, args->nProcs*args->nThreads*args->nGpus);
+        if (rankTimings[i].timing < rankTimings[minIndex].timing) {
+          minIndex = i;
+        }
+        if (rankTimings[i].timing > rankTimings[maxIndex].timing) {
+          maxIndex = i;
+        }
+      }
+      strncpy(globalMinHost, rankTimings[minIndex].hostname, 1024-1);
+      globalMinHost[1024-1] = '\0';
+      strncpy(globalMaxHost, rankTimings[maxIndex].hostname, 1024-1);
+      globalMaxHost[1024-1] = '\0';
+    }
+  }
+
+  if (r != MPI_SUCCESS) {
+    FPRINTF(stderr, "Gathering Rank Data Filed.\n");
+  }
+
+#endif
+
+  //Get Avg/Min/Max
   Allreduce(args, &deltaSec, average);
+  Allreduce(args, &deltaSecMin, 2); // min
+  Allreduce(args, &deltaSecMax, 3); // max
+
+  double times[3];
+  times[0] = deltaSecMin;
+  times[1] = deltaSec;
+  times[2] = deltaSecMax;
 
 #if CUDART_VERSION >= 11030
   if (cudaGraphLaunches >= 1) {
@@ -529,8 +626,11 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
 #endif
 
-  double algBw, busBw;
-  args->collTest->getBw(count, wordSize(type), deltaSec, &algBw, &busBw, args->nProcs*args->nThreads*args->nGpus);
+  double algBw[3], busBw[3];
+
+  for (int i = 0; i < 3; i++) {
+    args->collTest->getBw(count, wordSize(type), times[i], &algBw[i], &busBw[i], args->nProcs*args->nThreads*args->nGpus);
+  }
 
   Barrier(args);
 
@@ -593,21 +693,46 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
 
   double timeUsec = (report_cputime ? cputimeSec : deltaSec)*1.0E6;
-  char timeStr[100];
-  if (timeUsec >= 10000.0) {
-    sprintf(timeStr, "%7.0f", timeUsec);
-  } else if (timeUsec >= 100.0) {
-    sprintf(timeStr, "%7.1f", timeUsec);
-  } else {
-    sprintf(timeStr, "%7.2f", timeUsec);
+  char timeStrs[3][100];
+  for(int i = 0; i < 3; i++){
+    double timeUsec = (report_cputime ? cputimeSec : times[i])*1.0E6;
+    if (timeUsec >= 10000.0) {
+      sprintf(timeStrs[i], "%.0f", timeUsec);
+    } else if (timeUsec >= 100.0) {
+      sprintf(timeStrs[i], "%.1f", timeUsec);
+    } else {
+      sprintf(timeStrs[i], "%.2f", timeUsec);
+    }
   }
   if (args->reportErrors) {
-    PRINT("  %7s  %6.2f  %6.2f  %5g", timeStr, algBw, busBw, (double)wrongElts);
+    PRINT(" %s:%s:%s  %.2f:%.2f:%.2f  %.2f:%.2f:%.2f  %5g  minHost=%s  maxHost=%s",
+      timeStrs[0], timeStrs[1], timeStrs[2],
+      algBw[0], algBw[1], algBw[2],
+      busBw[0], busBw[1], busBw[2],
+      (double)wrongElts,
+#ifdef MPI_SUPPORT
+      globalMinHost,
+      globalMaxHost
+#else
+      "N/A", "N/A"
+#endif
+      );
   } else {
-    PRINT("  %7s  %6.2f  %6.2f  %5s", timeStr, algBw, busBw, "N/A");
+    PRINT(" %s:%s:%s  %.2f:%.2f:%.2f  %.2f:%.2f:%.2f  %5s  minHost=%s  maxHost=%s",
+      timeStrs[0], timeStrs[1], timeStrs[2],
+      algBw[0], algBw[1], algBw[2],
+      busBw[0], busBw[1], busBw[2],
+      "N/A",
+#ifdef MPI_SUPPORT
+      globalMinHost,
+      globalMaxHost
+#else
+      "N/A", "N/A"
+#endif
+      );
   }
 
-  args->bw[0] += busBw;
+  args->bw[0] += busBw[1];
   args->bw_count[0]++;
   return testSuccess;
 }
@@ -639,14 +764,20 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
     TESTCHECK(completeColl(args));
   }
 
+  struct timespec ts;
+  timespec_get(&ts, TIME_UTC);
+
   // Benchmark
   long repeat = run_cycles;
   do {
     for (size_t size = args->minbytes; size<=args->maxbytes; size = ((args->stepfactor > 1) ? size*args->stepfactor : size+args->stepbytes)) {
       setupArgs(size, type, args);
+      timespec_get(&ts, TIME_UTC);
       char rootName[100];
       sprintf(rootName, "%6i", root);
-      PRINT("%12li  %12li  %8s  %6s  %6s", max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, rootName);
+      PRINT("%10ld.%-9ld  %12ld  %12li  %8s  %6s  %6s", ts.tv_sec, ts.tv_nsec,
+        max(args->sendBytes, args->expectedBytes), args->nbytes / wordSize(type), typeName, opName, rootName);
+      
       TESTCHECK(BenchTime(args, type, op, root, 0));
       TESTCHECK(BenchTime(args, type, op, root, 1));
       PRINT("\n");
@@ -829,6 +960,7 @@ int main(int argc, char* argv[]) {
     {"ngpus", required_argument, 0, 'g'},
     {"minbytes", required_argument, 0, 'b'},
     {"maxbytes", required_argument, 0, 'e'},
+    {"rankdata_file", required_argument, 0, 'K'},
     {"stepbytes", required_argument, 0, 'i'},
     {"stepfactor", required_argument, 0, 'f'},
     {"iters", required_argument, 0, 'n'},
@@ -856,7 +988,7 @@ int main(int argc, char* argv[]) {
 
   while(1) {
     int c;
-    c = getopt_long(argc, argv, "t:g:b:e:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:x:D:V:", longopts, &longindex);
+    c = getopt_long(argc, argv, "t:g:b:e:K:i:f:n:m:w:N:p:c:o:d:r:z:y:T:hG:C:a:R:x:D:V:", longopts, &longindex);
 
     if (c == -1)
       break;
@@ -883,6 +1015,10 @@ int main(int argc, char* argv[]) {
           return -1;
         }
         maxBytes = (size_t)parsed;
+        break;
+      case 'K':
+        strncpy(rankDataFile, optarg, sizeof(rankDataFile));
+        rankDataFile[sizeof(rankDataFile)-1] = '\0';
         break;
       case 'i':
         parsed = parsesize(optarg);
@@ -1363,6 +1499,8 @@ testResult_t run() {
     threads[t].args.stepbytes=stepBytes;
     threads[t].args.stepfactor=stepFactor;
     threads[t].args.localRank = localRank;
+    threads[t].args.hostname = strdup(hostname);
+    threads[t].args.rankDataFile = strdup(rankDataFile);
 
     threads[t].args.totalProcs=totalProcs;
     threads[t].args.nProcs=ncclProcs;
@@ -1407,6 +1545,9 @@ testResult_t run() {
       bw[0] += bw[t];
       bw_count[0] += bw_count[t];
     }
+
+    free(threads[t].args.hostname);
+    free(threads[t].args.rankDataFile);
   }
 
 #ifdef MPI_SUPPORT
